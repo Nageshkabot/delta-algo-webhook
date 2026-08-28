@@ -1,123 +1,192 @@
 import os
-from flask import Flask, request, jsonify
+import time
+import math
+import hmac
+import hashlib
+import json
+import requests
+import ccxt
+import pandas as pd
+import pandas_ta as ta
+from fastapi import FastAPI
+from typing import Dict, Any
 
-app = Flask(__name__)
+app = FastAPI()
 
-# --- Pure Python Technical Calculations ---
+# ==================== CONFIGURATION ====================
+SYMBOL_BINANCE = "BTC/USDT"
+SYMBOL_DELTA = "BTCUSD"           # Delta Exchange Perpetual Symbol
+TIMEFRAME = "1m"
+LEVERAGE = 10                     # Delta Leverage
+POSITION_SIZE_USD = 100.0         # Allocated USD per trade
 
-def calculate_sma(data_list, period):
-    """Calculates Simple Moving Average for a given period."""
-    if len(data_list) < period:
-        # Return average of available data if less than period
-        return sum(data_list) / len(data_list)
-    return sum(data_list[-period:]) / period
+# Delta Exchange API Credentials (Set in Render Environment Variables)
+DELTA_API_KEY = os.environ.get("DELTA_API_KEY", "")
+DELTA_API_SECRET = os.environ.get("DELTA_API_SECRET", "")
+DELTA_BASE_URL = "https://api.delta.exchange"
 
-def get_pivot_low(candles, window=10):
-    """Returns the lowest price among the last 'window' candles."""
-    recent = candles[-window:] if len(candles) >= window else candles
-    return min(c['low'] for c in recent)
+# In-Memory State Tracking
+state = {
+    "position": None,         # "LONG", "SHORT", or None
+    "entry_price": 0.0,
+    "quantity": 0.0,
+    "last_signal": None
+}
 
-# --- Algorithmic Trading Engine ---
+# CCXT Binance Client (Public Data Engine)
+binance = ccxt.binance({'enableRateLimit': True})
 
-class TradingEngine:
-    def __init__(self, resistance_level=50.0):
-        self.resistance_level = resistance_level
-        self.pos_active = False
-        self.entry_price = 0.0
-        self.current_stop_loss = 0.0
 
-    def process_candles(self, candles):
-        """
-        Expects a list of dictionaries: [{'open': 10, 'high': 12, 'low': 9, 'close': 11}, ...]
-        """
-        if len(candles) < 2:
-            return {"status": "error", "message": "Minimum 2 candles required"}
+# ==================== DELTA EXCHANGE API SIGNER ====================
+def generate_delta_signature(method: str, path: str, payload: str, timestamp: str) -> str:
+    signature_data = method + timestamp + path + payload
+    return hmac.new(
+        DELTA_API_SECRET.encode('utf-8'),
+        signature_data.encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest()
 
-        closes = [c['close'] for c in candles]
+def delta_request(method: str, path: str, payload: dict = None) -> dict:
+    if not DELTA_API_KEY or not DELTA_API_SECRET:
+        return {"error": "Delta API Credentials Missing"}
 
-        # Calculate Indicators
-        sma_200 = calculate_sma(closes, 200)
-        sma_50 = calculate_sma(closes, 50)
-        sma_14 = calculate_sma(closes, 14)
+    timestamp = str(int(time.time()))
+    body_str = json.dumps(payload) if payload else ""
+    signature = generate_delta_signature(method, path, body_str, timestamp)
+
+    headers = {
+        "api-key": DELTA_API_KEY,
+        "timestamp": timestamp,
+        "signature": signature,
+        "Content-Type": "application/json"
+    }
+
+    url = f"{DELTA_BASE_URL}{path}"
+    try:
+        if method == "POST":
+            res = requests.post(url, headers=headers, data=body_str, timeout=10)
+        elif method == "GET":
+            res = requests.get(url, headers=headers, timeout=10)
+        return res.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def execute_delta_order(product_symbol: str, size: int, side: str) -> dict:
+    """Executes Market Order on Delta Exchange"""
+    path = "/v2/orders"
+    payload = {
+        "product_symbol": product_symbol,
+        "size": size,
+        "side": side.lower(),       # "buy" or "sell"
+        "order_type": "market_order"
+    }
+    return delta_request("POST", path, payload)
+
+
+# ==================== INDICATOR & SIGNAL ENGINE ====================
+def fetch_and_analyze() -> Dict[str, Any]:
+    # Fetch 250 1-minute candles from Binance
+    ohlcv = binance.fetch_ohlcv(SYMBOL_BINANCE, timeframe=TIMEFRAME, limit=250)
+    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+
+    # Exponential Moving Averages
+    df['ema14'] = ta.ema(df['close'], length=14)
+    df['ema14_smooth'] = ta.rma(df['close'], length=14)  # Smoothed 14 EMA (RMA/SMMA)
+    df['ema50'] = ta.ema(df['close'], length=50)
+    df['ema200'] = ta.ema(df['close'], length=200)
+
+    # Breakout Levels (20-period High/Low)
+    df['res_20'] = df['high'].shift(1).rolling(20).max()
+    df['sup_20'] = df['low'].shift(1).rolling(20).min()
+
+    curr = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    # Alignment Sequence Checks
+    bullish_ma = (curr['ema14'] > curr['ema14_smooth']) and \
+                 (curr['ema14_smooth'] > curr['ema50']) and \
+                 (curr['ema50'] > curr['ema200'])
+
+    bearish_ma = (curr['ema14'] < curr['ema14_smooth']) and \
+                 (curr['ema14_smooth'] < curr['ema50']) and \
+                 (curr['ema50'] < curr['ema200'])
+
+    # Breakout Checks
+    bullish_breakout = curr['close'] > prev['res_20']
+    bearish_breakout = curr['close'] < prev['sup_20']
+
+    signal = "HOLD"
+    if bullish_ma and bullish_breakout:
+        signal = "BUY"
+    elif bearish_ma and bearish_breakout:
+        signal = "SELL"
+
+    return {
+        "price": float(curr['close']),
+        "ema14": float(curr['ema14']),
+        "ema14_smooth": float(curr['ema14_smooth']),
+        "ema50": float(curr['ema50']),
+        "ema200": float(curr['ema200']),
+        "signal": signal
+    }
+
+
+# ==================== CRON / WEBHOOK TICKER ENDPOINT ====================
+@app.get("/")
+def home():
+    return {
+        "status": "online",
+        "engine": "Binance-Data-Delta-Execution-Trading-Bot",
+        "state": state
+    }
+
+@app.get("/tick")
+def process_market_tick():
+    """Call this route every minute via Cron/UptimeRobot to evaluate and trade"""
+    try:
+        analysis = fetch_and_analyze()
+        price = analysis["price"]
+        signal = analysis["signal"]
         
-        # Double Smoothed 14 MA (MA of 14 MA series)
-        sma_14_series = []
-        for i in range(1, len(closes) + 1):
-            sub_closes = closes[:i]
-            sma_14_series.append(calculate_sma(sub_closes, 14))
-        
-        sma_14_smooth = calculate_sma(sma_14_series, 14)
+        executed_trade = None
 
-        curr_close = closes[-1]
-        prev_close = closes[-2]
-        curr_low = candles[-1]['low']
+        # Exit Conditions (Trailing SL via EMA 14 Smooth Cross)
+        if state["position"] == "LONG" and (analysis["ema14"] < analysis["ema14_smooth"] or signal == "SELL"):
+            trade_res = execute_delta_order(SYMBOL_DELTA, int(state["quantity"]), "sell")
+            state["position"] = None
+            executed_trade = {"action": "EXIT_LONG", "price": price, "response": trade_res}
 
-        # 1. Moving Average Alignment Check (14_smooth > 14 > 50 > 200)
-        ma_alignment = (sma_14_smooth > sma_14) and (sma_14 > sma_50) and (sma_50 > sma_200)
+        elif state["position"] == "SHORT" and (analysis["ema14"] > analysis["ema14_smooth"] or signal == "BUY"):
+            trade_res = execute_delta_order(SYMBOL_DELTA, int(state["quantity"]), "buy")
+            state["position"] = None
+            executed_trade = {"action": "EXIT_SHORT", "price": price, "response": trade_res}
 
-        # 2. Resistance Breakout Check
-        breakout = (curr_close > self.resistance_level) and (prev_close <= self.resistance_level)
+        # Entry Conditions
+        if state["position"] is None:
+            contract_size = max(1, math.floor((POSITION_SIZE_USD * LEVERAGE) / price))
 
-        signal = "HOLD"
-        message = "No trigger conditions met."
+            if signal == "BUY":
+                trade_res = execute_delta_order(SYMBOL_DELTA, contract_size, "buy")
+                state["position"] = "LONG"
+                state["entry_price"] = price
+                state["quantity"] = contract_size
+                executed_trade = {"action": "ENTER_LONG", "price": price, "size": contract_size, "response": trade_res}
 
-        # --- ENTRY TRIGGER ---
-        if not self.pos_active and breakout and ma_alignment:
-            self.pos_active = True
-            self.entry_price = float(curr_close)
-            self.current_stop_loss = float(get_pivot_low(candles, window=10))
-            signal = "BUY_ENTRY"
-            message = f"BUY Triggered at {self.entry_price}. SL set at {self.current_stop_loss}"
-
-        # --- POSITION MANAGEMENT & TRAILING STOP LOSS ---
-        elif self.pos_active:
-            if curr_low <= self.current_stop_loss:
-                signal = "EXIT_SL_HIT"
-                message = f"Trailing SL Hit! Exit triggered at level: {self.current_stop_loss}"
-                self.pos_active = False
-                self.entry_price = 0.0
-                self.current_stop_loss = 0.0
-            else:
-                new_support = float(get_pivot_low(candles, window=10))
-                if new_support > self.current_stop_loss:
-                    self.current_stop_loss = new_support
-                    message = f"Position Active. Trailing SL updated to {self.current_stop_loss}"
-                else:
-                    message = f"Position Active. SL held at {self.current_stop_loss}"
+            elif signal == "SELL":
+                trade_res = execute_delta_order(SYMBOL_DELTA, contract_size, "sell")
+                state["position"] = "SHORT"
+                state["entry_price"] = price
+                state["quantity"] = contract_size
+                executed_trade = {"action": "ENTER_SHORT", "price": price, "size": contract_size, "response": trade_res}
 
         return {
-            "signal": signal,
-            "message": message,
-            "position_active": self.pos_active,
-            "entry_price": self.entry_price,
-            "current_stop_loss": self.current_stop_loss,
-            "indicators": {
-                "sma_200": round(sma_200, 2),
-                "sma_50": round(sma_50, 2),
-                "sma_14": round(sma_14, 2),
-                "sma_14_smooth": round(sma_14_smooth, 2)
-            }
+            "status": "success",
+            "market_price": price,
+            "analysis": analysis,
+            "trade_event": executed_trade,
+            "current_state": state
         }
 
-# Engine Instance
-engine = TradingEngine(resistance_level=50.0)
-
-@app.route("/", methods=["GET"])
-def health_check():
-    return jsonify({"status": "running", "engine": "zero-dependency-python"}), 200
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    try:
-        data = request.get_json(force=True)
-        if not data or "candles" not in data:
-            return jsonify({"status": "error", "message": "JSON must include 'candles' array"}), 400
-        
-        result = engine.process_candles(data["candles"])
-        return jsonify(result), 200
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+        return {"status": "error", "message": str(e)}
