@@ -185,36 +185,50 @@ def process_market_tick():
         current_pos = active_state["position"]
         pos_qty = active_state["quantity"]
 
-        executed_trade = None
+        executed_action = "NONE"
 
         # 2. Process Exits First
         if current_pos == "LONG" and (analysis["exit_long"] or signal == "SELL"):
-            trade_res = execute_delta_order(PRODUCT_SYMBOL, pos_qty, "sell")
-            executed_trade = {"action": "EXIT_LONG", "price": price, "quantity": pos_qty, "response": trade_res}
+            execute_delta_order(PRODUCT_SYMBOL, pos_qty, "sell")
+            executed_action = "EXIT_LONG"
             current_pos = None
 
         elif current_pos == "SHORT" and (analysis["exit_short"] or signal == "BUY"):
-            trade_res = execute_delta_order(PRODUCT_SYMBOL, pos_qty, "buy")
-            executed_trade = {"action": "EXIT_SHORT", "price": price, "quantity": pos_qty, "response": trade_res}
+            execute_delta_order(PRODUCT_SYMBOL, pos_qty, "buy")
+            executed_action = "EXIT_SHORT"
             current_pos = None
 
         # 3. Process Entries (Only if no active position)
-        if current_pos is None and executed_trade is None:
+        if current_pos is None and executed_action == "NONE":
             if signal == "BUY":
-                trade_res = execute_delta_order(PRODUCT_SYMBOL, LOT_SIZE, "buy")
-                executed_trade = {"action": "ENTER_LONG", "price": price, "lots": LOT_SIZE, "response": trade_res}
+                execute_delta_order(PRODUCT_SYMBOL, LOT_SIZE, "buy")
+                executed_action = "ENTER_LONG"
 
             elif signal == "SELL":
-                trade_res = execute_delta_order(PRODUCT_SYMBOL, LOT_SIZE, "sell")
-                executed_trade = {"action": "ENTER_SHORT", "price": price, "lots": LOT_SIZE, "response": trade_res}
+                execute_delta_order(PRODUCT_SYMBOL, LOT_SIZE, "sell")
+                executed_action = "ENTER_SHORT"
 
+        # Cron-job.org ke liye chhota aur lightweight response
         return {
-            "status": "success",
-            "market_price": price,
-            "analysis": analysis,
-            "trade_event": executed_trade,
-            "synced_state": active_state
+            "status": "ok",
+            "action": executed_action,
+            "signal": signal,
+            "price": price
         }
 
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/status")
+def full_status():
+    """Manual checking ke liye poora detail response"""
+    try:
+        analysis = fetch_and_analyze()
+        active_state = get_active_delta_position(PRODUCT_SYMBOL)
+        return {
+            "status": "success",
+            "analysis": analysis,
+            "active_position": active_state
+        }
     except Exception as e:
         return {"status": "error", "message": str(e)}
