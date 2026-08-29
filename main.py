@@ -15,27 +15,16 @@ app = FastAPI()
 
 # ==================== CONFIGURATION ====================
 SYMBOL_BINANCE = "BTC/USDT"
-SYMBOL_DELTA = "BTCUSD"           # Delta Exchange Perpetual Symbol
+SYMBOL_DELTA = "BTCUSD"
 TIMEFRAME = "1m"
-LEVERAGE = 10                     # Delta Leverage
-POSITION_SIZE_USD = 100.0         # Allocated USD per trade
+LEVERAGE = 10
+POSITION_SIZE_USD = 100.0
 
-# Delta Exchange API Credentials (Set in Render Environment Variables)
 DELTA_API_KEY = os.environ.get("DELTA_API_KEY", "")
 DELTA_API_SECRET = os.environ.get("DELTA_API_SECRET", "")
 DELTA_BASE_URL = "https://api.delta.exchange"
 
-# In-Memory State Tracking
-state = {
-    "position": None,         # "LONG", "SHORT", or None
-    "entry_price": 0.0,
-    "quantity": 0.0,
-    "last_signal": None
-}
-
-# CCXT Binance Client (Public Data Engine)
 binance = ccxt.binance({'enableRateLimit': True})
-
 
 # ==================== DELTA EXCHANGE API SIGNER ====================
 def generate_delta_signature(method: str, path: str, payload: str, timestamp: str) -> str:
@@ -71,39 +60,44 @@ def delta_request(method: str, path: str, payload: dict = None) -> dict:
     except Exception as e:
         return {"error": str(e)}
 
-
 def execute_delta_order(product_symbol: str, size: int, side: str) -> dict:
-    """Executes Market Order on Delta Exchange"""
     path = "/v2/orders"
     payload = {
         "product_symbol": product_symbol,
         "size": size,
-        "side": side.lower(),       # "buy" or "sell"
+        "side": side.lower(),
         "order_type": "market_order"
     }
     return delta_request("POST", path, payload)
 
+def get_active_delta_position(product_symbol: str) -> dict:
+    """Fetch live exchange state instead of relying on unstable in-memory state"""
+    path = f"/v2/positions?product_symbol={product_symbol}"
+    res = delta_request("GET", path)
+    if "result" in res and res["result"]:
+        size = int(res["result"].get("size", 0))
+        if size > 0:
+            return {"position": "LONG", "quantity": abs(size)}
+        elif size < 0:
+            return {"position": "SHORT", "quantity": abs(size)}
+    return {"position": None, "quantity": 0}
 
 # ==================== INDICATOR & SIGNAL ENGINE ====================
 def fetch_and_analyze() -> Dict[str, Any]:
-    # Fetch 250 1-minute candles from Binance
     ohlcv = binance.fetch_ohlcv(SYMBOL_BINANCE, timeframe=TIMEFRAME, limit=250)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
-    # Exponential Moving Averages
     df['ema14'] = ta.ema(df['close'], length=14)
-    df['ema14_smooth'] = ta.rma(df['close'], length=14)  # Smoothed 14 EMA (RMA/SMMA)
+    df['ema14_smooth'] = ta.rma(df['close'], length=14)
     df['ema50'] = ta.ema(df['close'], length=50)
     df['ema200'] = ta.ema(df['close'], length=200)
 
-    # Breakout Levels (20-period High/Low)
     df['res_20'] = df['high'].shift(1).rolling(20).max()
     df['sup_20'] = df['low'].shift(1).rolling(20).min()
 
     curr = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # Alignment Sequence Checks
     bullish_ma = (curr['ema14'] > curr['ema14_smooth']) and \
                  (curr['ema14_smooth'] > curr['ema50']) and \
                  (curr['ema50'] > curr['ema200'])
@@ -112,7 +106,6 @@ def fetch_and_analyze() -> Dict[str, Any]:
                  (curr['ema14_smooth'] < curr['ema50']) and \
                  (curr['ema50'] < curr['ema200'])
 
-    # Breakout Checks
     bullish_breakout = curr['close'] > prev['res_20']
     bearish_breakout = curr['close'] < prev['sup_20']
 
@@ -131,53 +124,44 @@ def fetch_and_analyze() -> Dict[str, Any]:
         "signal": signal
     }
 
-
-# ==================== CRON / WEBHOOK TICKER ENDPOINT ====================
+# ==================== CRON ENDPOINTS ====================
 @app.get("/")
 def home():
-    return {
-        "status": "online",
-        "engine": "Binance-Data-Delta-Execution-Trading-Bot",
-        "state": state
-    }
+    return {"status": "online", "engine": "Binance-Data-Delta-Execution-Trading-Bot"}
 
 @app.get("/tick")
 def process_market_tick():
-    """Call this route every minute via Cron/UptimeRobot to evaluate and trade"""
     try:
         analysis = fetch_and_analyze()
         price = analysis["price"]
         signal = analysis["signal"]
         
+        # Real-time state query from exchange API
+        active_state = get_active_delta_position(SYMBOL_DELTA)
+        current_pos = active_state["position"]
+        pos_qty = active_state["quantity"]
+
         executed_trade = None
 
-        # Exit Conditions (Trailing SL via EMA 14 Smooth Cross)
-        if state["position"] == "LONG" and (analysis["ema14"] < analysis["ema14_smooth"] or signal == "SELL"):
-            trade_res = execute_delta_order(SYMBOL_DELTA, int(state["quantity"]), "sell")
-            state["position"] = None
+        # Exits
+        if current_pos == "LONG" and (analysis["ema14"] < analysis["ema14_smooth"] or signal == "SELL"):
+            trade_res = execute_delta_order(SYMBOL_DELTA, pos_qty, "sell")
             executed_trade = {"action": "EXIT_LONG", "price": price, "response": trade_res}
 
-        elif state["position"] == "SHORT" and (analysis["ema14"] > analysis["ema14_smooth"] or signal == "BUY"):
-            trade_res = execute_delta_order(SYMBOL_DELTA, int(state["quantity"]), "buy")
-            state["position"] = None
+        elif current_pos == "SHORT" and (analysis["ema14"] > analysis["ema14_smooth"] or signal == "BUY"):
+            trade_res = execute_delta_order(SYMBOL_DELTA, pos_qty, "buy")
             executed_trade = {"action": "EXIT_SHORT", "price": price, "response": trade_res}
 
-        # Entry Conditions
-        if state["position"] is None:
+        # Entries
+        elif current_pos is None:
             contract_size = max(1, math.floor((POSITION_SIZE_USD * LEVERAGE) / price))
 
             if signal == "BUY":
                 trade_res = execute_delta_order(SYMBOL_DELTA, contract_size, "buy")
-                state["position"] = "LONG"
-                state["entry_price"] = price
-                state["quantity"] = contract_size
                 executed_trade = {"action": "ENTER_LONG", "price": price, "size": contract_size, "response": trade_res}
 
             elif signal == "SELL":
                 trade_res = execute_delta_order(SYMBOL_DELTA, contract_size, "sell")
-                state["position"] = "SHORT"
-                state["entry_price"] = price
-                state["quantity"] = contract_size
                 executed_trade = {"action": "ENTER_SHORT", "price": price, "size": contract_size, "response": trade_res}
 
         return {
@@ -185,7 +169,7 @@ def process_market_tick():
             "market_price": price,
             "analysis": analysis,
             "trade_event": executed_trade,
-            "current_state": state
+            "synced_state": active_state
         }
 
     except Exception as e:
