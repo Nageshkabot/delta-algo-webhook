@@ -11,10 +11,10 @@ from typing import Dict, Any
 app = FastAPI()
 
 # ==================== CONFIGURATION ====================
-PRODUCT_SYMBOL = "BTCUSD"         # Delta Exchange exact symbol
-TIMEFRAME = "1m"                  # Timeframe
+PRODUCT_SYMBOL = "BTCUSD"         # Delta Exchange Exact Symbol
+TIMEFRAME = "1m"                  # 1-Minute Chart
 
-LEVERAGE = 200                    # Delta Exchange Leverage
+LEVERAGE = 200                    # Delta Exchange Leverage (200x)
 LOT_SIZE = 1                      # Lot Quantity
 
 DELTA_API_KEY = os.environ.get("DELTA_API_KEY", "")
@@ -58,7 +58,6 @@ def delta_request(method: str, path: str, payload: dict = None) -> dict:
         return {"error": str(e)}
 
 def execute_delta_order(product_symbol: str, size: int, side: str) -> dict:
-    """Market Order Execute karne ke liye function"""
     path = "/v2/orders"
     payload = {
         "product_symbol": product_symbol,
@@ -70,27 +69,32 @@ def execute_delta_order(product_symbol: str, size: int, side: str) -> dict:
 
 def get_active_delta_position(product_symbol: str) -> dict:
     """
-    FIXED: Delta API positions array/list format me return karti hai.
-    Sahi symbol aur non-zero size filter karke exact Long/Short detect karega.
+    Robust Position Tracker: Detects both BTCUSD and BTCUSD_PERP active positions
     """
-    path = "/v2/positions"
+    path = f"/v2/positions?product_symbol={product_symbol}"
     res = delta_request("GET", path)
     
-    if "result" in res and isinstance(res["result"], list):
-        for pos in res["result"]:
-            # Correct product symbol aur non-zero position filter
-            if pos.get("product_symbol") == product_symbol or pos.get("product", {}).get("symbol") == product_symbol:
-                size = int(pos.get("size", 0))
+    if "result" not in res or not res["result"]:
+        path = "/v2/positions"
+        res = delta_request("GET", path)
+    
+    if "result" in res and res["result"]:
+        positions = res["result"] if isinstance(res["result"], list) else [res["result"]]
+        
+        for pos in positions:
+            pos_symbol = pos.get("product_symbol") or pos.get("product", {}).get("symbol", "")
+            
+            if product_symbol.lower() in pos_symbol.lower():
+                size = float(pos.get("size", 0))
                 if size > 0:
-                    return {"position": "LONG", "quantity": abs(size)}
+                    return {"position": "LONG", "quantity": abs(int(size))}
                 elif size < 0:
-                    return {"position": "SHORT", "quantity": abs(size)}
+                    return {"position": "SHORT", "quantity": abs(int(size))}
                     
     return {"position": None, "quantity": 0}
 
 # ==================== DATA FETCHING & ANALYSIS ====================
 def fetch_delta_ohlcv(symbol: str, resolution: str = "1m", limit: int = 250) -> pd.DataFrame:
-    """Delta API se candles fetch karta hai"""
     end_time = int(time.time())
     start_time = end_time - (limit * 60)
     
@@ -112,7 +116,7 @@ def fetch_delta_ohlcv(symbol: str, resolution: str = "1m", limit: int = 250) -> 
 def fetch_and_analyze() -> Dict[str, Any]:
     df = fetch_delta_ohlcv(PRODUCT_SYMBOL, resolution=TIMEFRAME, limit=250)
 
-    # Moving Averages Calculation
+    # Moving Averages
     df['ema14'] = df['close'].ewm(span=14, adjust=False).mean()
     df['ema14_smooth'] = df['close'].ewm(alpha=1/14, adjust=False).mean()
     df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
@@ -125,7 +129,7 @@ def fetch_and_analyze() -> Dict[str, Any]:
     curr = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # Entry Criteria Conditions
+    # Entry Signals
     bullish_ma = (curr['ema14'] > curr['ema14_smooth']) and \
                  (curr['ema14_smooth'] > curr['ema50']) and \
                  (curr['ema50'] > curr['ema200'])
@@ -143,7 +147,7 @@ def fetch_and_analyze() -> Dict[str, Any]:
     elif bearish_ma and bearish_breakout:
         signal = "SELL"
 
-    # Exit Signals (Based on EMA 14 Crossover)
+    # Exit Signals (EMA 14 Crossover)
     exit_long_condition = curr['ema14'] < curr['ema14_smooth']
     exit_short_condition = curr['ema14'] > curr['ema14_smooth']
 
@@ -176,25 +180,25 @@ def process_market_tick():
         price = analysis["price"]
         signal = analysis["signal"]
         
-        # 1. Fetch exact position from Delta
+        # 1. Fetch active position from Delta
         active_state = get_active_delta_position(PRODUCT_SYMBOL)
         current_pos = active_state["position"]
         pos_qty = active_state["quantity"]
 
         executed_trade = None
 
-        # 2. CHECK EXITS FIRST
+        # 2. Process Exits First
         if current_pos == "LONG" and (analysis["exit_long"] or signal == "SELL"):
             trade_res = execute_delta_order(PRODUCT_SYMBOL, pos_qty, "sell")
             executed_trade = {"action": "EXIT_LONG", "price": price, "quantity": pos_qty, "response": trade_res}
-            current_pos = None  # Reset position state after exit
+            current_pos = None
 
         elif current_pos == "SHORT" and (analysis["exit_short"] or signal == "BUY"):
             trade_res = execute_delta_order(PRODUCT_SYMBOL, pos_qty, "buy")
             executed_trade = {"action": "EXIT_SHORT", "price": price, "quantity": pos_qty, "response": trade_res}
-            current_pos = None  # Reset position state after exit
+            current_pos = None
 
-        # 3. CHECK ENTRIES (Only if no active position)
+        # 3. Process Entries (Only if no active position)
         if current_pos is None and executed_trade is None:
             if signal == "BUY":
                 trade_res = execute_delta_order(PRODUCT_SYMBOL, LOT_SIZE, "buy")
