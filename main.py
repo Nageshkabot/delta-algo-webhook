@@ -1,13 +1,11 @@
 import os
 import time
-import math
 import hmac
 import hashlib
 import json
 import requests
 import ccxt
 import pandas as pd
-import pandas_ta as ta
 from fastapi import FastAPI
 from typing import Dict, Any
 
@@ -17,9 +15,12 @@ app = FastAPI()
 SYMBOL_BINANCE = "BTC/USDT"
 SYMBOL_DELTA = "BTCUSD"
 TIMEFRAME = "1m"
-LEVERAGE = 10
-POSITION_SIZE_USD = 100.0
 
+# Trading Configurations
+LEVERAGE = 200                    # Delta Exchange Leverage (200x)
+LOT_SIZE = 1                      # <-- CHANGE LOTS HERE (e.g., 1, 2, 5 etc.)
+
+# Delta Exchange API Credentials
 DELTA_API_KEY = os.environ.get("DELTA_API_KEY", "")
 DELTA_API_SECRET = os.environ.get("DELTA_API_SECRET", "")
 DELTA_BASE_URL = "https://api.delta.exchange"
@@ -64,14 +65,13 @@ def execute_delta_order(product_symbol: str, size: int, side: str) -> dict:
     path = "/v2/orders"
     payload = {
         "product_symbol": product_symbol,
-        "size": size,
+        "size": size,                 # Executes exact lot size passed
         "side": side.lower(),
         "order_type": "market_order"
     }
     return delta_request("POST", path, payload)
 
 def get_active_delta_position(product_symbol: str) -> dict:
-    """Fetch live exchange state instead of relying on unstable in-memory state"""
     path = f"/v2/positions?product_symbol={product_symbol}"
     res = delta_request("GET", path)
     if "result" in res and res["result"]:
@@ -87,11 +87,13 @@ def fetch_and_analyze() -> Dict[str, Any]:
     ohlcv = binance.fetch_ohlcv(SYMBOL_BINANCE, timeframe=TIMEFRAME, limit=250)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
-    df['ema14'] = ta.ema(df['close'], length=14)
-    df['ema14_smooth'] = ta.rma(df['close'], length=14)
-    df['ema50'] = ta.ema(df['close'], length=50)
-    df['ema200'] = ta.ema(df['close'], length=200)
+    # Native EMA calculations
+    df['ema14'] = df['close'].ewm(span=14, adjust=False).mean()
+    df['ema14_smooth'] = df['close'].ewm(alpha=1/14, adjust=False).mean()  # RMA
+    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
+    df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
 
+    # Breakout Levels (20-period High/Low)
     df['res_20'] = df['high'].shift(1).rolling(20).max()
     df['sup_20'] = df['low'].shift(1).rolling(20).min()
 
@@ -127,7 +129,12 @@ def fetch_and_analyze() -> Dict[str, Any]:
 # ==================== CRON ENDPOINTS ====================
 @app.get("/")
 def home():
-    return {"status": "online", "engine": "Binance-Data-Delta-Execution-Trading-Bot"}
+    return {
+        "status": "online", 
+        "engine": "Binance-Data-Delta-Execution-Trading-Bot",
+        "configured_lots": LOT_SIZE,
+        "configured_leverage": LEVERAGE
+    }
 
 @app.get("/tick")
 def process_market_tick():
@@ -136,7 +143,6 @@ def process_market_tick():
         price = analysis["price"]
         signal = analysis["signal"]
         
-        # Real-time state query from exchange API
         active_state = get_active_delta_position(SYMBOL_DELTA)
         current_pos = active_state["position"]
         pos_qty = active_state["quantity"]
@@ -154,15 +160,13 @@ def process_market_tick():
 
         # Entries
         elif current_pos is None:
-            contract_size = max(1, math.floor((POSITION_SIZE_USD * LEVERAGE) / price))
-
             if signal == "BUY":
-                trade_res = execute_delta_order(SYMBOL_DELTA, contract_size, "buy")
-                executed_trade = {"action": "ENTER_LONG", "price": price, "size": contract_size, "response": trade_res}
+                trade_res = execute_delta_order(SYMBOL_DELTA, LOT_SIZE, "buy")
+                executed_trade = {"action": "ENTER_LONG", "price": price, "lots": LOT_SIZE, "response": trade_res}
 
             elif signal == "SELL":
-                trade_res = execute_delta_order(SYMBOL_DELTA, contract_size, "sell")
-                executed_trade = {"action": "ENTER_SHORT", "price": price, "size": contract_size, "response": trade_res}
+                trade_res = execute_delta_order(SYMBOL_DELTA, LOT_SIZE, "sell")
+                executed_trade = {"action": "ENTER_SHORT", "price": price, "lots": LOT_SIZE, "response": trade_res}
 
         return {
             "status": "success",
