@@ -12,20 +12,20 @@ from typing import Dict, Any
 app = FastAPI()
 
 # ==================== CONFIGURATION ====================
-SYMBOL_BINANCE = "BTC/USDT"
 SYMBOL_DELTA = "BTCUSD"
 TIMEFRAME = "1m"
 
 # Trading Configurations
 LEVERAGE = 200                    # Delta Exchange Leverage (200x)
-LOT_SIZE = 1                      # <-- CHANGE LOTS HERE (e.g., 1, 2, 5 etc.)
+LOT_SIZE = 1                      # <-- YAHAN LOT SIZE CHANGE KAREIN (e.g., 1, 2, 5 etc.)
 
 # Delta Exchange API Credentials
 DELTA_API_KEY = os.environ.get("DELTA_API_KEY", "")
 DELTA_API_SECRET = os.environ.get("DELTA_API_SECRET", "")
 DELTA_BASE_URL = "https://api.delta.exchange"
 
-binance = ccxt.binance({'enableRateLimit': True})
+# Delta Public CCXT Provider (Replaces Binance to fix location/geofence errors)
+market_data_provider = ccxt.delta({'enableRateLimit': True})
 
 # ==================== DELTA EXCHANGE API SIGNER ====================
 def generate_delta_signature(method: str, path: str, payload: str, timestamp: str) -> str:
@@ -65,7 +65,7 @@ def execute_delta_order(product_symbol: str, size: int, side: str) -> dict:
     path = "/v2/orders"
     payload = {
         "product_symbol": product_symbol,
-        "size": size,                 # Executes exact lot size passed
+        "size": size,                 # Lot quantity
         "side": side.lower(),
         "order_type": "market_order"
     }
@@ -84,7 +84,8 @@ def get_active_delta_position(product_symbol: str) -> dict:
 
 # ==================== INDICATOR & SIGNAL ENGINE ====================
 def fetch_and_analyze() -> Dict[str, Any]:
-    ohlcv = binance.fetch_ohlcv(SYMBOL_BINANCE, timeframe=TIMEFRAME, limit=250)
+    # Fetch live candles directly from Delta Exchange (No IP/Geofence restriction)
+    ohlcv = market_data_provider.fetch_ohlcv(SYMBOL_DELTA, timeframe=TIMEFRAME, limit=250)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
     # Native EMA calculations
@@ -131,7 +132,7 @@ def fetch_and_analyze() -> Dict[str, Any]:
 def home():
     return {
         "status": "online", 
-        "engine": "Binance-Data-Delta-Execution-Trading-Bot",
+        "engine": "Delta-Live-Data-And-Execution-Trading-Bot",
         "configured_lots": LOT_SIZE,
         "configured_leverage": LEVERAGE
     }
