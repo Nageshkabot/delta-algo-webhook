@@ -4,7 +4,6 @@ import hmac
 import hashlib
 import json
 import requests
-import ccxt
 import pandas as pd
 from fastapi import FastAPI
 from typing import Dict, Any
@@ -12,37 +11,17 @@ from typing import Dict, Any
 app = FastAPI()
 
 # ==================== CONFIGURATION ====================
-# Delta Exchange Native Product Symbol for Orders
-DELTA_PRODUCT_SYMBOL = "BTCUSD" 
+PRODUCT_SYMBOL = "BTCUSD"         # Chart ke hisab se exact symbol
+TIMEFRAME = "1m"                  # 1-minute chart
 
-TIMEFRAME = "1m"
 LEVERAGE = 200                    # Delta Exchange Leverage (200x)
-LOT_SIZE = 1                      # <-- CHANGE LOTS HERE (e.g., 1, 2, 5 etc.)
+LOT_SIZE = 1                      # Lot Quantity
 
 DELTA_API_KEY = os.environ.get("DELTA_API_KEY", "")
 DELTA_API_SECRET = os.environ.get("DELTA_API_SECRET", "")
-DELTA_BASE_URL = "https://api.delta.exchange"
 
-# Initialize Delta Exchange CCXT provider
-market_data_provider = ccxt.delta({'enableRateLimit': True})
-
-# Dynamic Symbol Mapping for CCXT Data Fetching
-CCXT_SYMBOL = None
-
-def get_valid_ccxt_symbol():
-    global CCXT_SYMBOL
-    if CCXT_SYMBOL:
-        return CCXT_SYMBOL
-    try:
-        markets = market_data_provider.load_markets()
-        for symbol in markets:
-            if DELTA_PRODUCT_SYMBOL in symbol:
-                CCXT_SYMBOL = symbol
-                return CCXT_SYMBOL
-        CCXT_SYMBOL = "BTC/USD:USD"  # Standard CCXT Fallback for Delta
-        return CCXT_SYMBOL
-    except Exception:
-        return "BTC/USD:USD"
+# DELTA EXCHANGE INDIA API BASE URL
+DELTA_BASE_URL = "https://api.india.delta.exchange"
 
 # ==================== DELTA EXCHANGE API SIGNER ====================
 def generate_delta_signature(method: str, path: str, payload: str, timestamp: str) -> str:
@@ -99,19 +78,38 @@ def get_active_delta_position(product_symbol: str) -> dict:
             return {"position": "SHORT", "quantity": abs(size)}
     return {"position": None, "quantity": 0}
 
+# ==================== DIRECT DELTA INDIA CANDLESTICK FETCHING ====================
+def fetch_delta_ohlcv(symbol: str, resolution: str = "1m", limit: int = 250) -> pd.DataFrame:
+    """Directly fetches live candles from Delta India API"""
+    end_time = int(time.time())
+    start_time = end_time - (limit * 60)
+    
+    url = f"{DELTA_BASE_URL}/v2/history/candles?symbol={symbol}&resolution={resolution}&start={start_time}&end={end_time}"
+    res = requests.get(url, timeout=10)
+    data = res.json()
+    
+    if "result" not in data or not data["result"]:
+        raise Exception(f"Failed to fetch market data from Delta: {data}")
+    
+    df = pd.DataFrame(data["result"])
+    df = df.sort_values(by="time").reset_index(drop=True)
+    
+    df['close'] = df['close'].astype(float)
+    df['high'] = df['high'].astype(float)
+    df['low'] = df['low'].astype(float)
+    return df
+
 # ==================== INDICATOR & SIGNAL ENGINE ====================
 def fetch_and_analyze() -> Dict[str, Any]:
-    data_symbol = get_valid_ccxt_symbol()
-    ohlcv = market_data_provider.fetch_ohlcv(data_symbol, timeframe=TIMEFRAME, limit=250)
-    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df = fetch_delta_ohlcv(PRODUCT_SYMBOL, resolution=TIMEFRAME, limit=250)
 
-    # Exponential Moving Averages
+    # Moving Averages
     df['ema14'] = df['close'].ewm(span=14, adjust=False).mean()
     df['ema14_smooth'] = df['close'].ewm(alpha=1/14, adjust=False).mean()
     df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
     df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
 
-    # Breakout Levels
+    # Breakout Levels (20-period High/Low)
     df['res_20'] = df['high'].shift(1).rolling(20).max()
     df['sup_20'] = df['low'].shift(1).rolling(20).min()
 
@@ -137,7 +135,6 @@ def fetch_and_analyze() -> Dict[str, Any]:
 
     return {
         "price": float(curr['close']),
-        "data_symbol_used": data_symbol,
         "ema14": float(curr['ema14']),
         "ema14_smooth": float(curr['ema14_smooth']),
         "ema50": float(curr['ema50']),
@@ -145,12 +142,13 @@ def fetch_and_analyze() -> Dict[str, Any]:
         "signal": signal
     }
 
-# ==================== CRON ENDPOINTS ====================
+# ==================== ENDPOINTS ====================
 @app.get("/")
 def home():
     return {
         "status": "online", 
-        "engine": "Delta-Live-Data-And-Execution-Trading-Bot",
+        "engine": "Delta-India-Native-Engine",
+        "symbol": PRODUCT_SYMBOL,
         "configured_lots": LOT_SIZE,
         "configured_leverage": LEVERAGE
     }
@@ -162,7 +160,7 @@ def process_market_tick():
         price = analysis["price"]
         signal = analysis["signal"]
         
-        active_state = get_active_delta_position(DELTA_PRODUCT_SYMBOL)
+        active_state = get_active_delta_position(PRODUCT_SYMBOL)
         current_pos = active_state["position"]
         pos_qty = active_state["quantity"]
 
@@ -170,21 +168,21 @@ def process_market_tick():
 
         # Exits
         if current_pos == "LONG" and (analysis["ema14"] < analysis["ema14_smooth"] or signal == "SELL"):
-            trade_res = execute_delta_order(DELTA_PRODUCT_SYMBOL, pos_qty, "sell")
+            trade_res = execute_delta_order(PRODUCT_SYMBOL, pos_qty, "sell")
             executed_trade = {"action": "EXIT_LONG", "price": price, "response": trade_res}
 
         elif current_pos == "SHORT" and (analysis["ema14"] > analysis["ema14_smooth"] or signal == "BUY"):
-            trade_res = execute_delta_order(DELTA_PRODUCT_SYMBOL, pos_qty, "buy")
+            trade_res = execute_delta_order(PRODUCT_SYMBOL, pos_qty, "buy")
             executed_trade = {"action": "EXIT_SHORT", "price": price, "response": trade_res}
 
         # Entries
         elif current_pos is None:
             if signal == "BUY":
-                trade_res = execute_delta_order(DELTA_PRODUCT_SYMBOL, LOT_SIZE, "buy")
+                trade_res = execute_delta_order(PRODUCT_SYMBOL, LOT_SIZE, "buy")
                 executed_trade = {"action": "ENTER_LONG", "price": price, "lots": LOT_SIZE, "response": trade_res}
 
             elif signal == "SELL":
-                trade_res = execute_delta_order(DELTA_PRODUCT_SYMBOL, LOT_SIZE, "sell")
+                trade_res = execute_delta_order(PRODUCT_SYMBOL, LOT_SIZE, "sell")
                 executed_trade = {"action": "ENTER_SHORT", "price": price, "lots": LOT_SIZE, "response": trade_res}
 
         return {
